@@ -1,0 +1,19 @@
+# --- HyLogger data: NOT allowed in the repo (hackathon rule). Download it yourself (see README). ---
+INTERIM_HyLogger_Dataset_Package_GDA2020_DB/
+data/
+*.sqlite
+*.tsg
+*.bip
+*.dat
+
+# Derived tables contain the data too -> regenerate with the pipeline
+outputs/*.csv
+
+# Keep figures and the viewer (outputs/plots/*.png, outputs/*.html)
+
+# Python / OS clutter
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+.ipynb_checkpoints/
