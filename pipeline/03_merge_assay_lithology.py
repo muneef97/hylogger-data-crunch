@@ -5,6 +5,8 @@ From-To range contains the interval midpoint, and take each value from the short
 record that has it; equal-length assay duplicates (lab check samples) are averaged.
 Assay rows longer than 10 m (whole-hole / summary rows) are removed.
 Handheld XRF (pXRF) rows are removed: field screening, not lab assays.
+Gold checks: values > 100x another record at the same depth are dropped (unit clash, e.g. ppb stored
+as ppm), and holes whose median gold is > 1 ppm (implausible) have gold set to missing.
 Negative assay values are below-detection flags (for Au they equal the documented lower limits)
 -> replaced with half the absolute value. Missing assays stay missing (never filled with 0).
 Only assay elements with data in >= 30% of the matched intervals are kept.
@@ -26,7 +28,7 @@ collar_to_hole = dict(zip(holes["WAMEX_CollarId"].astype(int), holes["Hole"]))
 
 def load_for_holes(name, usecols=None):
     df = pd.read_csv(CSV / name, encoding="utf-8-sig", na_values=["NULL"], usecols=usecols, low_memory=False)
-    df = df[df["CollarId"].isin(collar_to_hole)]
+    df = df[df["CollarId"].isin(collar_to_hole)].copy()
     df["Hole"] = df["CollarId"].map(collar_to_hole)
     return df
 
@@ -44,12 +46,21 @@ def attach(intervals, table, cols, numeric):
         t = table[table["Hole"] == hole]
         if t.empty:
             continue
-        x = (m[["Mid_m"]].reset_index().merge(t[["FromDepth", "ToDepth"] + cols], how="cross"))
-        x = x[(x["FromDepth"] <= x["Mid_m"]) & (x["Mid_m"] < x["ToDepth"])]
-        if x.empty:
+        # pair each record with the intervals whose midpoint lies in [FromDepth, ToDepth) without a full
+        # cross join (that needs too much memory on long holes): binary search on sorted midpoints
+        t = t.dropna(subset=["FromDepth", "ToDepth"])
+        m = m.sort_values("Mid_m"); mids = m["Mid_m"].to_numpy()
+        i0 = np.searchsorted(mids, t["FromDepth"].to_numpy(), side="left")
+        i1 = np.searchsorted(mids, t["ToDepth"].to_numpy(), side="left")
+        n = np.clip(i1 - i0, 0, None)
+        if n.sum() == 0:
             continue
+        rec = np.repeat(np.arange(len(t)), n)
+        pos = np.concatenate([np.arange(a, b) for a, b in zip(i0, i1) if b > a])
+        x = t[["FromDepth", "ToDepth"] + cols].iloc[rec].reset_index(drop=True)
+        x["index"] = m.index.to_numpy()[pos]
         n_cover.append(x.groupby("index").size())
-        x = x.assign(_len=x["ToDepth"] - x["FromDepth"]).sort_values("_len")
+        x = x.assign(_len=x["ToDepth"] - x["FromDepth"]).sort_values("_len", kind="stable")
         if numeric:
             # per element: keep only the shortest records that have a value, then average them
             # (equal-length duplicates are lab check samples, e.g. BWD072 "_CD")
@@ -84,6 +95,24 @@ assay = assay[~is_pxrf]
 too_long = (assay["ToDepth"] - assay["FromDepth"]) > 10
 print("Assay rows longer than 10 m removed per hole:", assay.loc[too_long, "Hole"].value_counts().to_dict() or "none")
 assay = assay[~too_long]
+
+# ---- gold sanity checks (the flat table can mix units / measurement types in the Au_PPM column) ----
+# (1) Same sample depth reported twice with values > 100x apart (e.g. KBD089: 0.002 and 11 -> a ppb
+#     value stored as ppm). Keep the lower value, drop the higher one.
+au = assay["Au_PPM"].abs().clip(lower=0.0005)
+lo = au.groupby([assay["Hole"], assay["FromDepth"], assay["ToDepth"]]).transform("min")
+unit_clash = assay["Au_PPM"].notna() & (au > 100 * lo)
+print("Au values dropped as unit clashes (>100x the other record at the same depth):",
+      assay.loc[unit_clash, "Hole"].value_counts().to_dict() or "none")
+assay.loc[unit_clash, "Au_PPM"] = np.nan
+# (2) A whole hole whose MEDIAN gold assay is above 1 ppm is not plausible for drill core (it would make
+#     the entire hole ore grade); e.g. 18KLDD008 reports 50-100 below 330 m, which look like leach
+#     recovery percentages. Gold is set to missing for such holes (other elements are kept).
+med = assay.groupby("Hole")["Au_PPM"].median()
+bad_au = med[med > 1].index.tolist()
+print("Holes whose gold is set to missing (median Au > 1 ppm, implausible):",
+      {h: round(med[h], 2) for h in bad_au} or "none")
+assay.loc[assay["Hole"].isin(bad_au), "Au_PPM"] = np.nan
 
 elem_cols = [c for c in assay if c.endswith(("_PCT", "_PPM", "_PPB"))]
 assay[elem_cols] = assay[elem_cols].apply(pd.to_numeric, errors="coerce")
