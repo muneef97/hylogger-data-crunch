@@ -9,7 +9,9 @@ data/
 # Derived tables contain the data too -> regenerate with the pipeline
 outputs/*.csv
 
-# Keep figures and the viewer (outputs/plots/*.png, outputs/*.html)
+# Keep figures (outputs/plots/*.png). The viewer HTML and run logs contain per-metre data -> not committed
+outputs/*.html
+outputs/*.txt
 
 # Python / OS clutter
 __pycache__/
@@ -19,3 +21,5 @@ __pycache__/
 .ipynb_checkpoints/
 HyLogger_Project_Guide.pdf
 EXPANSION_download_links.html
+outputs_*/
+*.zip
