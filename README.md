@@ -21,7 +21,7 @@ unchanged on any set of HyLogger summary mineral logs (`SM_<hole>.csv`).
 
 ## 1. Get the data (not included in this repo)
 
-HyLogger data — and anything derived from it per metre (tables, the HTML viewer, run logs) — must not be committed.
+HyLogger data — and anything derived from it per metre (tables, the app data, run logs) — must not be committed.
 `.gitignore` already excludes it. Download it yourself:
 
 1. **DASC package** – https://dasc.dmirs.wa.gov.au/ → search **"HyLogger Drillhole Package"** → download
@@ -46,9 +46,10 @@ HyLogger/
 │   ├── DATABASES/CSV/*.csv
 │   ├── MINERAL_LOGS/SM_*.csv
 │   └── TSG/BWD072/                                 (optional, step 15)
-├── pipeline/       00_ … 16_ scripts, config.py, cluster_names.py, viewer template
+├── pipeline/       00_ … 16_ scripts, config.py, cluster_names.py
 ├── tools/          fetch_tsg_spectra.py
-├── outputs/        tables, run_log.txt, viewer (git-ignored) + plots/
+├── app/            streamlit_app.py + hylogger_analysis.py + build_app_data.py (optional explorer)
+├── outputs/        tables and run_log.txt (git-ignored) + plots/
 ├── run_all.sh
 ├── requirements.txt
 ├── README.md
@@ -92,30 +93,48 @@ Scripts 00 and 00b (hole selection) are run once, before downloading. Step 16 al
 | 00b | `select_expansion_holes` | 59 more holes: Tier A more Yilgarn gold (≤ 4 per project); Tier B other gold regions, copper, nickel | `EXPANSION_download_list.csv`, `download_mineral_logs.sh` |
 | 01 | `load_mineral_logs` | Reads every `SM_*.csv`, skips the metadata header, `N.A.` → missing | `01_mineral_intervals.csv` |
 | 02 | `clean_minerals_and_holes` | Blank proportion = not detected (0); excludes holes by rule (see below); drops only minerals never detected; QC flag where SWIR invalid > 50% | `02_minerals_clean.csv`, `02_holes.csv` |
-| 03 | `merge_assay_lithology` | Joins WAMEX assays + logged geology to each metre (shortest covering record); removes handheld XRF, > 10 m rows, ppb/ppm gold clashes, holes with implausible gold | `03_merged_intervals.csv` |
+| 03 | `merge_assay_lithology` | Joins WAMEX assays + logged geology to each metre (shortest covering record); removes handheld XRF rows, > 10 m rows, multi-element Au that disagrees with fire assay, implausible gold, missing-value codes (−999/−5000/−9999) | `03_merged_intervals.csv` |
 | 04 | `exploratory_summary` | QC counts, dominant minerals, per-hole profiles, gold/background counts | `04_*.csv` |
 | 05 | `pca_clustering` | PCA + k-means (k 4–10 by silhouette) → mineral assemblages | `05_*.csv` |
 | 06 | `within_hole_gold` | Mineral–gold correlation *within* each hole; cluster gold lift with 10 m block-bootstrap CI | `06_*.csv` |
 | 07 | `anomaly_detection` | Isolation Forest (top 3%) with the minerals that make each metre unusual; lift vs gold at several cut-offs | `07_*.csv` |
 | 08 | `plots` | Strip logs, clusters, PCA, lift chart, cluster heatmap, map | `plots/08*.png` |
-| 09 | `interactive_viewer` | Self-contained offline HTML viewer of all holes | `09_hylogger_viewer.html` |
 | 10 | `rock_type_from_minerals` | Felsic index from TIR minerals → felsic / intermediate / mafic; cut-offs calibrated leave-one-hole-out; ternary + pseudologs | `10_*.csv`, `plots/10a_ternary.png`, `plots/10b_pseudologs.png` |
+| 10d | `rock_types_from_minerals` | Q4: the 9 rock types named in the geology logs; random forest on all minerals, tested on unseen holes and companies; 5 composition groups; first-pass rock log with an 'unsure' flag | `10d_*.csv`, `plots/10d_rock_types.png` |
 | 11 | `boundary_detection` | PELT change-points (split at scanning gaps) → mineral zones; tested against logged contacts vs 5,000 random boundary sets | `11_*.csv`, `plots/11_zones_*.png` |
 | 12 | `predictive_models` | Au, As, S, Sb, Cu, MgO from minerals (PLS, Random Forest) on unseen holes and depth blocks; pathfinders vs gold | `12_*.csv`, `plots/12*.png` |
 | 13 | `dataset_overview` | Whole index: 2,019 scans of 1,907 holes by region, commodity and data available; map | `13_dataset_overview.csv`, `plots/13*.png` |
 | 14 | `endmembers_and_features` | NMF endmembers, number chosen by refit stability; within-hole gold sign test with BH correction; wavelength features | `14_*.csv`, `plots/14*.png` |
 | 15 | `raw_spectra_bwd072` | *Optional.* Raw BWD072 spectra via `pytsg`: own hull-quotient white-mica feature, checked against TSG and the 1 m log | `15_bwd072_metre_features.csv`, `plots/15*.png` |
 | 16 | `bulk_property_prediction` | 34 elements from minerals, PLS (inner CV) and gradient boosting, GroupKFold by hole and by company | `16_bulk_prediction_scores.csv`, `plots/16_bulk_prediction.png` |
+| 16b | `mgo_example` | Q5 picture: MgO predicted vs lab for unseen companies, plus one example hole (chosen by a fixed rule) | `16b_mgo_predictions.csv`, `plots/16b_mgo_example.png` |
+
+### Interactive explorer (optional)
+
+```bash
+pip install -r app/requirements.txt
+python app/build_app_data.py                      # converts the pipeline outputs into the app's format (~5 s)
+python -m streamlit run app/streamlit_app.py      # venv active, so it uses the venv packages
+```
+The **HyLogger Insight Explorer** (adapted from a team member's app) on our 65 holes: scorecard of the five GSWA
+questions, map, downhole explorer and downhole tracks (minerals, endmembers, assemblage, rock class vs log, assays,
+pipeline boundaries), interactive Q1-Q5 analyses you can tune (endmember count, boundary penalty, rock-type model,
+PLS) shown beside the pipeline's validated results, anomaly review, and the data-quality findings. It reads only
+`outputs/`; run it locally only (it shows per-metre data). The first visit to Q5 takes 1-2 minutes (then cached).
+The app replaces the earlier simple explorer and the static HTML viewer.
 
 ## 4. Design choices & limitations
 
 * **Validation on unseen holes / companies.** Models are always scored on holes (or companies) they never saw, and
   against the simple "predict the training average" baseline. Within-hole scores are reported only as a diagnostic.
-* **Gold is tested within holes**, because pooled correlations mostly reflect differences between holes. Only 11 holes
+* **Gold is tested within holes**, because pooled correlations mostly reflect differences between holes. Only 10 holes
   have enough gold and background metres for this, so gold results are exploratory; multiple tests are BH-corrected.
-* **Assay cleaning (03):** handheld XRF rows (Niton/pXRF metadata, or no company sample ID), assay rows > 10 m, gold
-  values > 100× another record at the same depth (ppb/ppm clash), and holes with median Au > 1 ppm (recovery %
-  stored as grade) are removed. Below detection → half the detection limit.
+* **Assay cleaning (03).** The flat assay table merges lab methods without saying which row is which, so 03:
+  removes handheld XRF rows (Niton/pXRF in the metadata and no company sample ID); ignores Au from multi-element
+  packages where it disagrees with the dedicated gold assay at the same depths (Spearman < 0.3, e.g. KBD089/KBD094);
+  removes assay rows > 10 m; drops a gold value > 100× another record at the same depth; sets gold to missing in
+  holes with median Au > 1 ppm (18KLDD008, leach recovery %); treats −999/−5000/−9999 as missing; other negative
+  values → half the detection limit. Each rule prints what it removed. Doubtful values are set aside, never "corrected".
 * **Excluded holes (02), by rule, not by name:** MRDH400/401/402/403/407 (geologist-refined results only — a different
   method — and no TIR) and GBD011_chips (chip scan, not drill core; no TIR). Listed in `outputs/02_excluded_holes.csv`.
 * **Scans ≠ holes:** the index lists 2,019 scans of 1,907 holes (re-scans, wedges, chips, cuttings).
@@ -137,7 +156,10 @@ its NCI zip URL and change `HOLE` in script 15.
 | Data engineering | 00, 00b, 01–03, 13, 15, `run_all.sh`, `tools/` |
 | Machine learning | 04–07, 16 |
 | Geoscience | 10–12, 14 |
-| Visualisation | 08, 09, `cluster_names.py` |
+| Visualisation | 08, 09, `cluster_names.py`, `app/` |
+
+The map / downhole layout of the app was adapted from a team member's *HyLogger Insight Explorer*
+prototype, which also contributed the index-to-WAMEX linkage audit quoted in FINDINGS.
 
 Code was developed with AI assistance (Claude) and reviewed step by step by the team and a second AI reviewer; every
 number in `FINDINGS.md` comes from running this repository.

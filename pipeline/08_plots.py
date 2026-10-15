@@ -1,11 +1,15 @@
 """08 - Figures for the pitch / report (PNG, saved to outputs/plots/).
 
   08a_strip_<HOLE>.png      downhole strip log per hole: SWIR mineral mix | cluster | Au (log) | anomalies
-  08b_clusters_all_holes.png cluster column for all 12 holes side by side
+  08b_clusters_all_holes.png cluster column for every retained hole side by side
   08c_pca_gold.png           PC1 vs PC2 coloured by Au (log), cluster centres labelled
-  08d_cluster_gold_lift.png  gold lift per cluster after controlling for hole (from script 06)
+  08d_cluster_gold_lift.png  gold lift per cluster after controlling for hole, with 90% block-bootstrap
+                             intervals (both from script 06)
   08e_cluster_minerals.png   heatmap of mean mineral proportion per cluster
   08f_hole_map.png           hole locations (lat/lon), sized by gold intervals
+Cluster names come from pipeline/cluster_names.py (shared with 09): dominant mineral + most enriched mineral: descriptions of
+spectral mineral assemblages, not confirmed rock types. PCA axis labels are built from the actual
+loadings saved by script 05. Old 08 figures are deleted first so no stale hole plots remain.
 Colours: colourblind-validated categorical palette in fixed order; one-hue blue ramp for magnitudes.
 """
 from pathlib import Path
@@ -19,8 +23,12 @@ from matplotlib.patches import Patch
 
 OUT = Path(__file__).resolve().parents[1] / "outputs"
 PLOTS = OUT / "plots"; PLOTS.mkdir(exist_ok=True)
+for old in PLOTS.glob("08*.png"):        # remove figures from earlier runs (e.g. holes since excluded)
+    try: old.unlink()
+    except OSError: print("Could not delete old figure:", old.name)
 
-CAT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
+CAT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948",
+       "#8a5a2b", "#0097a7", "#6d6d00", "#a23b72"]          # up to 12 clusters (05 searches k = 4..10)
 GREY = "#b9b8b3"; INK = "#0b0b0b"; INK2 = "#52514e"; SURF = "#fcfcfb"
 BLUE_RAMP = LinearSegmentedColormap.from_list("blue", ["#cde2fb", "#86b6ef", "#2a78d6", "#1c5cab", "#0d366b"])
 plt.rcParams.update({"figure.facecolor": SURF, "axes.facecolor": SURF, "axes.edgecolor": GREY,
@@ -34,23 +42,20 @@ lift = pd.read_csv(OUT / "06_cluster_gold_lift.csv")
 # ---- automatic cluster names: dominant mineral + most ENRICHED mineral vs dataset average ----
 mins = [c for c in d if c.startswith(("SWIR_", "TIR_")) and "Invalid" not in c and d[c].mean() > 0.005]
 prof = d.groupby("Cluster")[mins].mean()
-def short(c): return c.replace("SWIR_", "").replace("TIR_", "")
-enrich = (prof - d[mins].mean()) / d[mins].std()          # z-score of cluster mean
-names = {}
-for k in prof.index:
-    dom = short(prof.loc[k].idxmax())
-    enr = [short(c) for c in enrich.loc[k].sort_values(ascending=False).index if short(c) != dom][0]
-    names[k] = f"C{k}: {dom}-rich, high {enr}"
+from cluster_names import cluster_names                      # shared with script 09
+names = {k: f"C{k}: {v}" for k, v in cluster_names(d).items()}
 clusters = sorted(names)
+assert len(clusters) <= len(CAT), f"{len(clusters)} clusters but only {len(CAT)} colours"
 cl_cmap = ListedColormap(CAT[:len(clusters)])
 
 # ---- SWIR mineral groups for the strip log (fixed order, max 8 incl. Other) ----
 GROUPS = {"White mica": ["SWIR_White-Mica"], "Chlorite": ["SWIR_Chlorite"], "Amphibole": ["SWIR_Amphibole"],
           "Dark mica": ["SWIR_Dark-Mica"], "Carbonate": ["SWIR_Carbonate"], "Epidote": ["SWIR_Epidote"],
           "Clays (kaolin/smectite)": ["SWIR_Kaolin", "SWIR_Smectite"]}
-for g in GROUPS: d[g] = d[[c for c in GROUPS[g] if c in d]].sum(axis=1)
 grp = list(GROUPS)
-d["Other / invalid"] = (1 - d[grp].sum(axis=1)).clip(lower=0)
+new = pd.DataFrame({g: d[[c for c in GROUPS[g] if c in d]].sum(axis=1) for g in GROUPS})
+new["Other / invalid"] = (1 - new[grp].sum(axis=1)).clip(lower=0)
+d = pd.concat([d, new], axis=1)                              # add all at once (no fragmentation warning)
 grp_all = grp + ["Other / invalid"]
 grp_cols = CAT[:7] + [GREY]
 
@@ -116,8 +121,12 @@ for k in clusters:
     c = d[d["Cluster"] == k][["PC1", "PC2"]].mean()
     ax.annotate(f"C{k}", c, ha="center", va="center", fontsize=10, weight="bold", color=INK,
                 bbox=dict(boxstyle="round,pad=0.2", fc=SURF, ec=GREY, lw=0.8))
-ax.set_xlabel("PC1  (white mica + carbonate  ←→  amphibole + epidote)")
-ax.set_ylabel("PC2  (dark mica + plagioclase  ←→  chlorite + Fe)")
+load = pd.read_csv(OUT / "05_pca_loadings.csv", index_col=0)
+def pc_label(pc):                        # two strongest loadings at each end, read from script 05
+    s = load[pc].sort_values()
+    neg = " + ".join(c.replace("_", " ") for c in s.index[:2]); pos = " + ".join(c.replace("_", " ") for c in s.index[-2:][::-1])
+    return f"{pc}  ({neg}  ←→  {pos})"
+ax.set_xlabel(pc_label("PC1")); ax.set_ylabel(pc_label("PC2"))
 ax.set_title("Intervals in PCA space, coloured by gold grade", loc="left", weight="bold")
 ax.legend(frameon=False, loc="lower right")
 fig.savefig(PLOTS / "08c_pca_gold.png", dpi=150, bbox_inches="tight"); plt.close(fig)
@@ -125,14 +134,20 @@ fig.savefig(PLOTS / "08c_pca_gold.png", dpi=150, bbox_inches="tight"); plt.close
 # ---- 08d gold lift ----
 L = lift.sort_values("lift"); L["name"] = L["Cluster"].map(names)
 fig, ax = plt.subplots(figsize=(8, 4.5))
-ax.barh(L["name"], L["lift"], color="#2a78d6", height=0.6)
+holds = (L["lift_90ci_low"] > 1) | (L["lift_90ci_high"] < 1)      # interval clear of 1
+ax.barh(L["name"], L["lift"], color=np.where(holds, "#2a78d6", "#cde2fb"), height=0.6)
+ax.errorbar(L["lift"], range(len(L)), xerr=[L["lift"] - L["lift_90ci_low"], L["lift_90ci_high"] - L["lift"]],
+            fmt="none", ecolor=INK, elinewidth=1, capsize=3)
 ax.axvline(1, color=INK2, lw=1, ls="--")
-for y, (v, n) in enumerate(zip(L["lift"], L["n"])):
-    ax.text(v + 0.03, y, f"{v:.2f}×  (n={n})", va="center", fontsize=8, color=INK2,
+for y, (v, hi, n, e) in enumerate(zip(L["lift"], L["lift_90ci_high"], L["n"], L["expected"])):
+    txt = f"{v:.2f}×  (n={n})" if e >= 1 else f"too few gold metres expected ({e}) to judge  (n={n})"
+    ax.text(max(v, hi) + 0.05, y, txt, va="center", fontsize=8, color=INK2,
             bbox=dict(fc=SURF, ec="none", pad=1), zorder=3)
+fig.text(0.01, -0.04, "Black lines = 90% range (10 m depth blocks resampled 500 times). Dark bars: range clear of 1. "
+         "Cluster names are automatic descriptions, not rock types.", fontsize=7.5, color=INK2)
 ax.set_xlabel("Gold lift (observed ÷ expected Au ≥ 0.5 ppm intervals, controlling for hole)")
 ax.set_title("Which assemblages are richer in gold than their own hole's average?", loc="left", weight="bold")
-ax.set_xlim(0, L["lift"].max() * 1.3)
+ax.set_xlim(0, L["lift_90ci_high"].max() * 1.25)
 fig.savefig(PLOTS / "08d_cluster_gold_lift.png", dpi=150, bbox_inches="tight"); plt.close(fig)
 
 # ---- 08e cluster mineral heatmap ----
@@ -168,4 +183,5 @@ ax.grid(color=GREY, lw=0.4, alpha=0.5)
 fig.savefig(PLOTS / "08f_hole_map.png", dpi=150, bbox_inches="tight"); plt.close(fig)
 
 print("Cluster names:"); [print(" ", v) for v in names.values()]
-print("\nSaved:", sorted(p.name for p in PLOTS.glob("*.png")))
+print("\nSaved (this script):", sorted(p.name for p in PLOTS.glob("08*.png")))
+print("Holes plotted:", d["Hole"].nunique(), sorted(d["Hole"].unique()))

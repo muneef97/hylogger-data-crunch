@@ -1,0 +1,4 @@
+streamlit>=1.48
+plotly>=5.20
+scikit-learn
+scipy
