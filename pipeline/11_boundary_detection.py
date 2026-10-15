@@ -3,12 +3,17 @@
 Follows GSWA's 'Boundary detection' idea ("Can we automatically map divisions in stratigraphy?").
 Method (per hole):
   * Features = SWIR + TIR mineral proportions (standardised across all holes).
-  * Low-confidence intervals are skipped; a depth gap > 3 m always starts a new zone.
+  * Low-confidence intervals are skipped; ANY depth gap (unscanned or skipped metres) starts a new
+    run, so PELT never treats metres either side of a gap as neighbours.
   * Change-point detection with PELT (ruptures library, 'l2' cost = changes in the average mix),
     minimum zone length 5 m, penalty = PEN_FACTOR x log(n) x number of features (a BIC-style penalty).
-Validation (independent of the method): where the company geologist's lithology CODE changes is a
-'logged contact'. We measure the share of our boundaries within +-3 m of a logged contact, and compare
-with randomly placed boundaries (same number, same hole, 500 shuffles) - the fair baseline.
+Validation (independent of the method): a 'logged contact' is where two DEPTH-CONTIGUOUS metres both
+have a company lithology code and the codes differ (from script 03, all metres). We measure the share
+of our boundaries within +-3 m of a logged contact. Fair baseline: the same number of random boundaries
+drawn only from ELIGIBLE positions (positions where PELT could have put a boundary AND the log has a
+code), at least 5 m apart - 5,000 draws per hole, each draw keeping that hole's boundary count; the
+pooled statistic sums the holes draw by draw. p = (1 + draws doing as well) / (1 + 5,000).
+Only our boundaries at eligible positions are scored.
 Codes are only used to find WHERE the log changes; their meaning is not interpreted.
 Outputs: outputs/11_zones.csv, outputs/11_boundaries.csv, outputs/plots/11_zones_<HOLE>.png
 """
@@ -22,8 +27,27 @@ import matplotlib.pyplot as plt
 
 OUT = Path(__file__).resolve().parents[1] / "outputs"
 PLOTS = OUT / "plots"; PLOTS.mkdir(exist_ok=True)
-MIN_ZONE_M, GAP_M, PEN_FACTOR, TOL_M = 5, 3, 1.0, 3
+MIN_ZONE_M, PEN_FACTOR, TOL_M, N_RAND = 5, 1.0, 3, 5000
 rng = np.random.default_rng(0)
+for old in PLOTS.glob("11_zones_*.png"):        # no stale figures from earlier runs
+    try: old.unlink()
+    except OSError: print("Could not delete old figure:", old.name)
+
+# logged contacts from ALL metres (script 03): contiguous metres, both coded, codes differ
+logs = pd.read_csv(OUT / "03_merged_intervals.csv", low_memory=False).sort_values(["Hole", "From_m"])
+def logged_contacts(hole):
+    a = logs[logs["Hole"] == hole]
+    prev_code, prev_to = a["Lith_code"].shift(), a["To_m"].shift()
+    ok = a["Lith_code"].notna() & prev_code.notna() & (a["From_m"] == prev_to) & (a["Lith_code"] != prev_code)
+    return a.loc[ok, "From_m"].to_numpy()
+coded = set(zip(logs.loc[logs["Lith_code"].notna(), "Hole"], logs.loc[logs["Lith_code"].notna(), "From_m"]))
+
+def random_spaced(pos, k):
+    """k distinct eligible positions, all at least MIN_ZONE_M apart (rejection sampling)."""
+    for _ in range(1000):
+        x = np.sort(rng.choice(pos, k, replace=False))
+        if k < 2 or np.diff(x).min() >= MIN_ZONE_M: return x
+    raise RuntimeError("could not place random boundaries with the spacing rule")
 
 d = pd.read_csv(OUT / "05_intervals_with_clusters.csv", low_memory=False).sort_values(["Hole", "From_m"])
 lith = pd.read_csv(OUT / "03_merged_intervals.csv", low_memory=False)[["Hole", "From_m", "Lith_code"]]
@@ -37,10 +61,10 @@ zones, bounds, checks = [], [], []
 pooled_obs, pooled_rand = [], []
 for hole, h in d.groupby("Hole"):
     h = h[~h["QC_low_confidence"]]
-    use = [f for f in feats if not (hole == "MRDH400" and f.startswith("TIR_"))]   # MRDH400: no TIR
-    # split into continuous runs (gap > GAP_M starts a new run)
-    run_id = (h["From_m"] - h["To_m"].shift() > GAP_M).cumsum()
-    hole_b = []
+    use = feats
+    # split into continuous runs (any gap starts a new run)
+    run_id = (h["From_m"] - h["To_m"].shift() > 0).cumsum()
+    hole_b, eligible = [], []
     for _, r in h.groupby(run_id):
         X = Z.loc[r.index, use].to_numpy()
         if len(r) >= 2 * MIN_ZONE_M:
@@ -57,38 +81,44 @@ for hole, h in d.groupby("Hole"):
                           "Top_minerals": ", ".join(f"{c} {v:.2f}" for c, v in seg[use].mean().sort_values(ascending=False).head(3).items()),
                           "Mean_Au_ppm": round(seg["Au_PPM"].mean(), 3) if seg["Au_PPM"].notna().any() else np.nan})
         hole_b += [r["From_m"].iloc[c] for c in cps]
+        if len(r) >= 2 * MIN_ZONE_M:                 # positions PELT could choose in this run
+            eligible += [x for x in r["From_m"].iloc[MIN_ZONE_M:len(r) - MIN_ZONE_M + 1] if (hole, x) in coded]
     bounds += [{"Hole": hole, "Boundary_m": b} for b in hole_b]
 
     # ---- validation against logged contacts ----
-    g = h.dropna(subset=["Lith_code"])
-    contacts = g["From_m"][g["Lith_code"] != g["Lith_code"].shift()].iloc[1:].to_numpy()
-    if len(contacts) >= 3 and len(hole_b) >= 3:
-        hit = lambda bs: np.mean([np.min(np.abs(contacts - b)) <= TOL_M for b in bs])
-        lo, hi = g["From_m"].min(), g["From_m"].max()
-        inside = [b for b in hole_b if lo <= b <= hi]
-        if len(inside) >= 3:
-            rand = [hit(rng.uniform(lo, hi, len(inside))) for _ in range(500)]
-            pooled_obs.append(hit(inside) * len(inside)); pooled_rand.append(np.array(rand) * len(inside))
-            checks.append({"Hole": hole, "our_boundaries": len(inside), "logged_contacts": len(contacts),
-                           "ours_near_contact": round(hit(inside), 2), "random_near_contact": round(np.mean(rand), 2),
-                           "p_value": round(np.mean(np.array(rand) >= hit(inside)), 3)})
+    contacts = logged_contacts(hole)
+    eligible = np.array(sorted(set(eligible)))
+    inside = [b for b in hole_b if b in set(eligible)]
+    if len(contacts) >= 3 and len(inside) >= 3:
+        hit = lambda bs: int(sum(np.min(np.abs(contacts - b)) <= TOL_M for b in bs))
+        rand = np.array([hit(random_spaced(eligible, len(inside))) for _ in range(N_RAND)])
+        obs = hit(inside)
+        pooled_obs.append(obs); pooled_rand.append(rand)
+        checks.append({"Hole": hole, "our_boundaries": len(inside), "eligible_positions": len(eligible),
+                       "logged_contacts": len(contacts), "ours_near_contact": round(obs / len(inside), 2),
+                       "random_near_contact": round(rand.mean() / len(inside), 2),
+                       "p_value": round((1 + (rand >= obs).sum()) / (1 + N_RAND), 4)})
 
 zones = pd.DataFrame(zones); bounds = pd.DataFrame(bounds); checks = pd.DataFrame(checks)
 zones.to_csv(OUT / "11_zones.csv", index=False); bounds.to_csv(OUT / "11_boundaries.csv", index=False)
 checks.to_csv(OUT / "11_boundary_validation.csv", index=False)
 
-print(f"Zones found: {len(zones)} across {zones['Hole'].nunique()} holes "
-      f"(median zone length {zones['Length_m'].median():.0f} m)")
+print(f"Boundaries found by PELT (mineral change points): {len(bounds)} across {bounds['Hole'].nunique()} holes")
+print(f"Zones: {len(zones)} (includes short pieces between scanning gaps, where no boundary can be tested; "
+      f"median zone length {zones['Length_m'].median():.0f} m)")
 print(zones.groupby("Hole").agg(zones=("Length_m", "size"), median_len_m=("Length_m", "median")).to_string())
 print(f"\nValidation vs logged lithology contacts (boundary within +-{TOL_M} m of a contact):")
 print(checks.to_string(index=False))
 if len(checks):
     w = checks["our_boundaries"]
+    print(f"Validated subset: {w.sum()} of the {len(bounds)} PELT boundaries, in {len(checks)} holes "
+          f"(only boundaries at positions with a lithology code, in holes with >= 3 contacts and >= 3 boundaries)")
     print(f"Weighted: ours {np.average(checks['ours_near_contact'], weights=w):.0%} vs random "
           f"{np.average(checks['random_near_contact'], weights=w):.0%}")
     tot_obs, tot_rand = sum(pooled_obs), np.sum(pooled_rand, axis=0)
     print(f"Pooled test across holes: {tot_obs:.0f} of {w.sum()} boundaries near a contact; random average "
-          f"{tot_rand.mean():.1f}; p = {np.mean(tot_rand >= tot_obs):.3f} (share of 500 random runs doing as well)")
+          f"{tot_rand.mean():.1f}; p = {(1 + (tot_rand >= tot_obs).sum()) / (1 + N_RAND):.4f} "
+          f"({N_RAND:,} random draws from eligible, logged positions, >= {MIN_ZONE_M} m apart)")
 
 # ---- figures: strip of mineral mix with zone boundaries + logged contacts ----
 CAT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7"]
@@ -104,8 +134,7 @@ for hole in show:
         bottom += h[col].to_numpy()
     for b in bounds.loc[bounds["Hole"] == hole, "Boundary_m"]:
         ax.axvline(b, color="#0b0b0b", lw=1.6)
-    g = h.dropna(subset=["Lith_code"])
-    for c in g["From_m"][g["Lith_code"] != g["Lith_code"].shift()].iloc[1:]:
+    for c in logged_contacts(hole):
         ax.plot([c, c], [1.02, 1.1], color="#e34948", lw=1.4, clip_on=False)
     ax.set_ylim(0, 1); ax.set_xlabel("Depth (m)"); ax.set_ylabel("SWIR mineral share")
     ax.spines[["top", "right"]].set_visible(False)

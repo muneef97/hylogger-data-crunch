@@ -12,7 +12,12 @@ Each interval's three values are rescaled to sum to 1 (a ternary position), then
   Chlorite modifier on Intermediate / Mafic: weak (< 0.25), moderate (0.25-0.5), strong (> 0.5)
   felsic + mafic + chlorite < 0.15 of the interval -> 'Unclassified (low signal)'
 Thresholds are OUR choices (set below) - easy to change.
-MRDH400 has no TIR data -> not classified. Low-confidence intervals are not classified.
+Low-confidence intervals are not classified (removed in 05; MRDH400 is removed in 02).
+
+Calibration: the two felsic-index cut-offs are tuned with leave-one-hole-out, using the SAME rule as
+above (chlorite modifier included) and a minimum gap of 0.10 between them so 'Intermediate' always
+exists. Reported: interval-weighted AND mean per-hole accuracy, plus per-class recall. The logs are a
+reference, not verified ground truth (terms and scale vary between geologists).
 
 Check against logs: only EXPLICIT words are used as 'truth' (lithology name, GSWA rock name,
 geologist comments: felsic / intermediate / mafic / granite / dolerite / basalt / gabbro ...).
@@ -43,6 +48,7 @@ full = pd.read_csv(OUT / "03_merged_intervals.csv", low_memory=False)
 d = d.merge(full[["Hole", "From_m", "Geology_comments"]], on=["Hole", "From_m"], how="left") \
     if "Geology_comments" not in d else d
 
+d = d.copy()                                  # de-fragment the wide table before adding columns
 d["felsic"] = d["TIR_Silica"] + d["TIR_K-Feldspar"]
 d["mafic"] = d["TIR_Pyroxene"] + d["TIR_Amphibole"]
 d["chlorite"] = d["TIR_Chlorite"]
@@ -51,14 +57,18 @@ for c in ["felsic", "mafic", "chlorite"]:
     d[c + "_n"] = np.where(s > 0, d[c] / s, np.nan)
 fi = d["felsic_n"] / (d["felsic_n"] + d["mafic_n"]).replace(0, np.nan)
 
+def broad_class(fi_vals, chl, felsic_fi, inter_fi):
+    """ONE rule used everywhere (fixed and calibrated cut-offs)."""
+    fi_vals, chl = np.asarray(fi_vals, float), np.asarray(chl, float)
+    return np.where((fi_vals >= felsic_fi) & (chl < CHL_WEAK), "Felsic",
+                    np.where(fi_vals >= inter_fi, "Intermediate", "Mafic"))
+
 def classify(i):
-    if d.at[i, "Hole"] == "MRDH400": return "Not classified (no TIR)"
     if s[i] < MIN_SIGNAL or pd.isna(fi[i]): return "Unclassified (low signal)"
     c = d.at[i, "chlorite_n"]
     mod = "weak chl" if c < CHL_WEAK else ("mod chl" if c < CHL_STRONG else "strong chl")
-    if fi[i] >= FELSIC_FI and c < CHL_WEAK: return "Felsic"
-    if fi[i] >= INTER_FI: return f"Intermediate, {mod}"
-    return f"Mafic, {mod}"
+    b = broad_class([fi[i]], [c], FELSIC_FI, INTER_FI)[0]
+    return b if b == "Felsic" else f"{b}, {mod}"
 d["HyLogger_rock"] = [classify(i) for i in d.index]
 d["HyLogger_broad"] = d["HyLogger_rock"].str.split(",").str[0]
 
@@ -97,22 +107,32 @@ agree.to_csv(OUT / "10_rock_type_agreement.csv")
 # reported accuracy is on holes the tuning never saw.
 lab = d[d["Logged_broad"].isin(["Felsic", "Intermediate", "Mafic"]) & d["HyLogger_broad"].isin(["Felsic", "Intermediate", "Mafic"])].copy()
 lab["FI"] = fi[lab.index]
-def cls(fi_vals, a, b):
-    return np.where(fi_vals >= a, "Felsic", np.where(fi_vals >= b, "Intermediate", "Mafic"))
-grid = [(a, b) for a in np.arange(0.50, 0.96, 0.05) for b in np.arange(0.20, 0.90, 0.05) if b < a]
+def cls(df, a, b):
+    return broad_class(df["FI"], df["chlorite_n"], a, b)
+steps = [round(x, 2) for x in np.arange(0.20, 0.96, 0.05)]
+grid = [(a, b) for a in steps for b in steps if a >= 0.50 and a - b >= 0.10 - 1e-9]   # Intermediate band >= 0.10 wide
 rows = []
 for h in lab["Hole"].unique():
     tr, te = lab[lab["Hole"] != h], lab[lab["Hole"] == h]
-    best = max(grid, key=lambda ab: (cls(tr["FI"], *ab) == tr["Logged_broad"]).mean())
-    rows.append({"held_out_hole": h, "n": len(te), "best_cutoffs_on_others": tuple(round(x, 2) for x in best),
-                 "accuracy_on_held_out": (cls(te["FI"], *best) == te["Logged_broad"]).mean().round(2),
+    best = max(grid, key=lambda ab: (cls(tr, *ab) == tr["Logged_broad"]).mean())
+    lab.loc[te.index, "Pred_calibrated"] = cls(te, *best)
+    rows.append({"held_out_hole": h, "n": len(te), "best_cutoffs_on_others": best,
+                 "accuracy_on_held_out": (cls(te, *best) == te["Logged_broad"]).mean().round(2),
                  "accuracy_fixed_cutoffs": (te["Logged_broad"] == te["HyLogger_broad"]).mean().round(2)})
 loho = pd.DataFrame(rows).sort_values("n", ascending=False)
 w = lambda col: (loho[col] * loho["n"]).sum() / loho["n"].sum()
 print("\nCalibrated cut-offs, leave-one-hole-out:\n", loho.to_string(index=False))
-print(f"Overall (weighted by intervals): fixed cut-offs {w('accuracy_fixed_cutoffs'):.0%} -> calibrated {w('accuracy_on_held_out'):.0%}")
-best_all = max(grid, key=lambda ab: (cls(lab["FI"], *ab) == lab["Logged_broad"]).mean())
-print(f"Cut-offs tuned on ALL labelled holes (for use on new holes): Felsic FI >= {best_all[0]:.2f}, Intermediate FI >= {best_all[1]:.2f}")
+print(f"Overall, weighted by intervals: fixed cut-offs {w('accuracy_fixed_cutoffs'):.0%} -> calibrated {w('accuracy_on_held_out'):.0%}")
+print(f"Overall, mean of holes (each hole counts once): fixed {loho['accuracy_fixed_cutoffs'].mean():.0%} -> "
+      f"calibrated {loho['accuracy_on_held_out'].mean():.0%}")
+print("\nCalibrated (held-out) confusion table, rows = log:")
+print(pd.crosstab(lab["Logged_broad"], lab["Pred_calibrated"], margins=True).to_string())
+rec = lambda col: (lab[col] == lab["Logged_broad"]).groupby(lab["Logged_broad"]).mean()   # recall per logged class
+print("Recall per logged class (fixed -> calibrated):",
+      {k: f"{a:.0%} -> {b:.0%}" for k, a, b in zip(rec("HyLogger_broad").index, rec("HyLogger_broad"), rec("Pred_calibrated"))})
+best_all = max(grid, key=lambda ab: (cls(lab, *ab) == lab["Logged_broad"]).mean())
+print(f"Candidate cut-offs tuned on ALL labelled holes (to be tested on new holes, not validated): "
+      f"Felsic FI >= {best_all[0]:.2f}, Intermediate FI >= {best_all[1]:.2f}")
 loho.to_csv(OUT / "10_rock_type_calibration_loho.csv", index=False)
 
 # ---- clusters vs logged lithology (patterns across rock classifications) ----
@@ -150,10 +170,15 @@ if show:
     for ax, hole in zip(axes[0], show):
         h = d[d["Hole"] == hole].sort_values("From_m")
         broad = h["HyLogger_broad"].where(h["HyLogger_broad"].isin(CAT))
-        # 'large scale' = most common class in a 9 m window
+        # 'large scale' = most common class in a 9 m DEPTH window: put metres on a full 1 m grid first,
+        # so unscanned gaps stay empty and are not bridged by the window
         codes = broad.map({"Felsic": 0, "Intermediate": 1, "Mafic": 2})
-        large = codes.rolling(9, center=True, min_periods=3).apply(
+        codes.index = np.floor(h["From_m"]).astype(int)
+        codes = codes[~codes.index.duplicated()]
+        grid_m = codes.reindex(range(codes.index.min(), codes.index.max() + 1))
+        large = grid_m.rolling(9, center=True, min_periods=3).apply(
             lambda w: pd.Series(w).dropna().mode().iloc[0] if pd.Series(w).notna().any() else np.nan, raw=True)
+        large = pd.Series(large.reindex(np.floor(h["From_m"]).astype(int)).values, index=h.index)
         inv = {0: "Felsic", 1: "Intermediate", 2: "Mafic"}
         for j, (series, label) in enumerate([(broad, "HyLogger\n(1 m)"), (large.map(inv), "HyLogger\n(9 m smoothed)"),
                                              (h["Logged_broad"].where(h["Logged_broad"].isin(CAT)), "Geology\nlog")]):
