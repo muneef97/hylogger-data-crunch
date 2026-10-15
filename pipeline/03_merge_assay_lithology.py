@@ -5,9 +5,14 @@ From-To range contains the interval midpoint, and take each value from the short
 record that has it; equal-length assay duplicates (lab check samples) are averaged.
 Assay rows longer than 10 m (whole-hole / summary rows) are removed.
 Handheld XRF (pXRF) rows are removed: field screening, not lab assays.
-Gold checks: values > 100x another record at the same depth are dropped (unit clash, e.g. ppb stored
-as ppm), and holes whose median gold is > 1 ppm (implausible) have gold set to missing.
-Negative assay values are below-detection flags (for Au they equal the documented lower limits)
+Gold checks (the flat table merges several methods into one Au column, with no method per row):
+  (a) where a hole has a dedicated gold assay (rows with Au and at most 3 other elements, e.g. fire
+      assay Au/Pd/Pt) AND multi-element rows that also report Au at the same depths, and the two
+      disagree (Spearman < 0.3), Au from the multi-element rows is ignored (e.g. KBD089: whole-number
+      'Au' 1-35, Spearman -0.03 vs fire assay; method not recorded in the metadata);
+  (b) values > 100x another record at the same depth are dropped (keep the lower);
+  (c) holes whose median gold is > 1 ppm (implausible) have gold set to missing.
+Missing-data sentinels (-999, -5000, -9999) -> missing. Other negative assay values are below-detection flags (for Au they equal the documented lower limits)
 -> replaced with half the absolute value. Missing assays stay missing (never filled with 0).
 Only assay elements with data in >= 30% of the matched intervals are kept.
 Output: outputs/03_merged_intervals.csv
@@ -96,16 +101,38 @@ too_long = (assay["ToDepth"] - assay["FromDepth"]) > 10
 print("Assay rows longer than 10 m removed per hole:", assay.loc[too_long, "Hole"].value_counts().to_dict() or "none")
 assay = assay[~too_long]
 
-# ---- gold sanity checks (the flat table can mix units / measurement types in the Au_PPM column) ----
-# (1) Same sample depth reported twice with values > 100x apart (e.g. KBD089: 0.002 and 11 -> a ppb
-#     value stored as ppm). Keep the lower value, drop the higher one.
+# ---- gold sanity checks (the flat table merges several methods into one Au_PPM column) ----
+elem_raw = [c for c in assay if c.endswith(("_PCT", "_PPM", "_PPB"))]
+n_elem = assay[elem_raw].notna().sum(axis=1)
+has_au = assay["Au_PPM"].notna()
+gold_row = has_au & (n_elem <= 4)        # dedicated gold assay: Au + at most 3 others (e.g. Pd, Pt, Ag)
+multi_row = has_au & (n_elem > 4)        # multi-element package that also reports Au
+# (a) Multi-element Au that does not agree with the dedicated gold assay at the same depths is ignored.
+key = ["Hole", "FromDepth", "ToDepth"]
+au_num = pd.to_numeric(assay["Au_PPM"], errors="coerce")
+g = au_num[gold_row].groupby([assay.loc[gold_row, k] for k in key]).mean().rename("gold")
+m = au_num[multi_row].groupby([assay.loc[multi_row, k] for k in key]).mean().rename("multi")
+pair = pd.concat([g, m], axis=1, join="inner").reset_index()
+rows = []
+for h, d in pair.groupby("Hole"):
+    if len(d) >= 10:
+        rows.append((h, len(d), round(d["gold"].corr(d["multi"], method="spearman"), 2)))
+check = pd.DataFrame(rows, columns=["Hole", "shared_depths", "spearman"])
+print("Multi-element Au vs dedicated gold assay at the same depths (holes with >= 10 shared depths):")
+print(check.to_string(index=False) if len(check) else "  none")
+bad_multi = set(check.loc[check["spearman"] < 0.3, "Hole"])
+drop_multi = multi_row & assay["Hole"].isin(bad_multi)
+print("Multi-element Au values ignored (disagree with the gold assay):",
+      assay.loc[drop_multi, "Hole"].value_counts().to_dict() or "none")
+assay.loc[drop_multi, "Au_PPM"] = np.nan
+# (b) Same sample depth reported twice with values > 100x apart: keep the lower value.
 au = assay["Au_PPM"].abs().clip(lower=0.0005)
 lo = au.groupby([assay["Hole"], assay["FromDepth"], assay["ToDepth"]]).transform("min")
 unit_clash = assay["Au_PPM"].notna() & (au > 100 * lo)
-print("Au values dropped as unit clashes (>100x the other record at the same depth):",
+print("Au values dropped (>100x another record at the same depth):",
       assay.loc[unit_clash, "Hole"].value_counts().to_dict() or "none")
 assay.loc[unit_clash, "Au_PPM"] = np.nan
-# (2) A whole hole whose MEDIAN gold assay is above 1 ppm is not plausible for drill core (it would make
+# (c) A whole hole whose MEDIAN gold assay is above 1 ppm is not plausible for drill core (it would make
 #     the entire hole ore grade); e.g. 18KLDD008 reports 50-100 below 330 m, which look like leach
 #     recovery percentages. Gold is set to missing for such holes (other elements are kept).
 med = assay.groupby("Hole")["Au_PPM"].median()
@@ -116,7 +143,15 @@ assay.loc[assay["Hole"].isin(bad_au), "Au_PPM"] = np.nan
 
 elem_cols = [c for c in assay if c.endswith(("_PCT", "_PPM", "_PPB"))]
 assay[elem_cols] = assay[elem_cols].apply(pd.to_numeric, errors="coerce")
-assay[elem_cols] = assay[elem_cols].where(assay[elem_cols] >= 0, assay[elem_cols].abs() / 2)
+# Missing-data sentinels are NOT below-detection flags: -5000 fills almost every element in 1,579 rows
+# of ETG0202/0204/0226 (incl. Au), and -999 is GSWA's missing marker (meta_data_quality checks 34-36).
+SENTINELS = [-999, -5000, -9999]
+is_sent = assay[elem_cols].isin(SENTINELS)
+print("Missing-data sentinels (-999/-5000/-9999) set to missing, per hole:",
+      assay.loc[is_sent.any(axis=1), "Hole"].value_counts().to_dict() or "none")
+assay[elem_cols] = assay[elem_cols].mask(is_sent)
+assay[elem_cols] = assay[elem_cols].where(assay[elem_cols].isna() | (assay[elem_cols] >= 0), assay[elem_cols].abs() / 2)
+assay = assay.copy()  # de-fragment after the column-wise cleaning (avoids pandas PerformanceWarning spam)
 A, a_cover = attach(minerals, assay, elem_cols, numeric=True)
 keep = A.columns[A.notna().mean() >= 0.30]
 A = A[keep]

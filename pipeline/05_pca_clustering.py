@@ -4,10 +4,15 @@ Features: SWIR + TIR mineral proportions and spectral indices (wavelength positi
   * Low-confidence intervals (QC flag) excluded.
   * Spectral indices missing where the mineral is absent -> filled with the column median.
   * All features standardised (z-scores).
+  * Minerals averaging <= 0.5 % are left out of the clustering (list printed). They are kept in the
+    data and tested on their own in 06 (e.g. tourmaline); very sparse columns add noise to distances.
+PCA is for describing the main directions of variation only. KMeans runs on all standardised
+features (not on the PCs), so no information is dropped.
 Clustering: KMeans, k chosen by silhouette score over k = 4..10 (all intervals scored;
-when scores are within 0.005 of the best, the smallest k is chosen).
-MRDH400 (geologist-refined results only, not comparable) is excluded when FITTING
-the scaler/PCA/KMeans, then its intervals are assigned to the nearest cluster.
+when scores are within 0.005 of the best, the smallest k is chosen). Silhouette scores are low
+(~0.15-0.18): mineral mixes grade into each other, so clusters are groupings of a continuum,
+not proof of distinct rock types. Clusters = spectral mineral assemblages, not rock types.
+(MRDH400, which has no automated results, is removed in script 02.)
 Outputs: outputs/05_intervals_with_clusters.csv, outputs/05_cluster_profiles.csv, outputs/05_pca_loadings.csv
 """
 from pathlib import Path
@@ -23,18 +28,17 @@ d = pd.read_csv(OUT / "03_merged_intervals.csv", low_memory=False)
 d = d[~d["QC_low_confidence"]].reset_index(drop=True)
 
 minerals = [c for c in d if c.startswith(("SWIR_", "TIR_")) and "Invalid" not in c]
+left_out = [c for c in minerals if d[c].mean() <= 0.005]
 minerals = [c for c in minerals if d[c].mean() > 0.005]          # keep minerals with meaningful presence
+print("Minerals left out of clustering (mean <= 0.5 %; share of metres with >= 10 %):")
+print("  " + ", ".join(f"{c} {(d[c] >= 0.1).mean():.1%}" for c in left_out))
 indices = [c for c in ["2200W_AlOH", "2250W_FeOH", "900D_Fe", "1900D_Water", "8625D_Quartz", "VIS-SWIR_Albedo"] if c in d]
 X = d[minerals + indices].copy()
 X[indices] = X[indices].fillna(X[indices].median())
-FIT_EXCLUDE = ["MRDH400"]
-fit_mask = ~d["Hole"].isin(FIT_EXCLUDE).values
-scaler = StandardScaler().fit(X[fit_mask])
-Xs = scaler.transform(X)
-Xf = Xs[fit_mask]
+Xs = StandardScaler().fit_transform(X)
 
 # ---- PCA ----
-pca = PCA(n_components=6, random_state=0).fit(Xf)
+pca = PCA(n_components=6, random_state=0).fit(Xs)
 pcs = pca.transform(Xs)
 for i in range(3):
     d[f"PC{i+1}"] = pcs[:, i]
@@ -50,23 +54,17 @@ for pc in ["PC1", "PC2"]:
 # ---- choose k ----
 scores = {}
 for k in range(4, 11):
-    lab = KMeans(n_clusters=k, n_init=10, random_state=0).fit_predict(Xf)
-    scores[k] = silhouette_score(Xf, lab)   # all intervals (no random sampling) -> stable choice of k
+    lab = KMeans(n_clusters=k, n_init=10, random_state=0).fit_predict(Xs)
+    scores[k] = silhouette_score(Xs, lab)   # all intervals (no random sampling) -> stable choice of k
 print("\nSilhouette by k:", {k: round(v, 3) for k, v in scores.items()})
 # Practically-tied scores -> prefer the simpler model: smallest k within TOL of the best score.
 TOL = 0.005
 best_k = min(k for k, v in scores.items() if v >= max(scores.values()) - TOL)
-km = KMeans(n_clusters=best_k, n_init=20, random_state=0).fit(Xf)
-d["Cluster"] = km.predict(Xs)
-# MRDH400 has no TIR data (TIR columns are 0, not 'absent'), so assign it to the nearest
-# cluster centre using SWIR-derived features only.
-swir_feats = [i for i, c in enumerate(X.columns) if c.startswith("SWIR_") or c in
-              ["2200W_AlOH", "2250W_FeOH", "900D_Fe", "1900D_Water", "VIS-SWIR_Albedo"]]
-nf = ~fit_mask
-dist = ((Xs[nf][:, None, swir_feats] - km.cluster_centers_[None, :, swir_feats]) ** 2).sum(axis=2)
-d["Cluster"] = d["Cluster"].astype("int64")
-d.loc[nf, "Cluster"] = dist.argmin(axis=1).astype("int64")
-print("MRDH400 assigned with SWIR-only features:", d.loc[nf, "Cluster"].value_counts().to_dict())
+if best_k == max(scores):
+    print(f"NOTE: best k is at the top of the search range ({best_k}). The range is capped at 10 on purpose "
+          "(more groups are hard to interpret and silhouette is low throughout); see README.")
+km = KMeans(n_clusters=best_k, n_init=20, random_state=0).fit(Xs)
+d["Cluster"] = km.labels_.astype("int64")
 print("Chosen k =", best_k)
 
 # ---- describe clusters ----

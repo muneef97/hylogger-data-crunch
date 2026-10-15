@@ -23,3 +23,15 @@ HyLogger_Project_Guide.pdf
 EXPANSION_download_links.html
 outputs_*/
 *.zip
+
+# Teammate exploration folder (contains raw data copies; never commit)
+HyLogger_DataCrunch/
+# app data built from outputs (per-metre data; never commit)
+outputs/app/
+
+# notebook run outputs (per-metre derived data)
+outputs_notebook/
+notebook/outputs_notebook/
+
+# Files kept locally but not part of the repo (old viewer, superseded scripts, friend's notebook)
+_archive/

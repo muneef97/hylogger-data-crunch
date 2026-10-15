@@ -10,7 +10,7 @@ set -o pipefail
 cd "$(dirname "$0")"
 PY="${PYTHON:-python3}"
 
-for s in 01 02 03 04 05 06 07 08 09 10 11 12 13 14 16; do   # 15 is optional (needs raw TSG files + pytsg)
+for s in 01 02 03 04 05 06 07 08 10 10d 11 12 13 14 16 16b; do   # 15 is optional (needs raw TSG files + pytsg)
   f=$(ls pipeline/${s}_*.py)
   echo ""
   echo "=================== $f ==================="
